@@ -3,11 +3,12 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { IAction } from '../../../../base/common/actions.js';
 import { DeferredPromise } from '../../../../base/common/async.js';
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Event } from '../../../../base/common/event.js';
 import { IMarkdownString } from '../../../../base/common/htmlContent.js';
-import { IObservable } from '../../../../base/common/observable.js';
+import { autorunSelfDisposable, IObservable } from '../../../../base/common/observable.js';
 import { ThemeIcon } from '../../../../base/common/themables.js';
 import { URI } from '../../../../base/common/uri.js';
 import { IRange, Range } from '../../../../editor/common/core/range.js';
@@ -15,9 +16,11 @@ import { ISelection } from '../../../../editor/common/core/selection.js';
 import { Command, Location, TextEdit } from '../../../../editor/common/languages.js';
 import { FileType } from '../../../../platform/files/common/files.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
+import { IAutostartResult } from '../../mcp/common/mcpTypes.js';
 import { ICellEditOperation } from '../../notebook/common/notebookCommon.js';
 import { IWorkspaceSymbol } from '../../search/common/search.js';
 import { IChatAgentCommand, IChatAgentData, IChatAgentResult, UserSelectedTools } from './chatAgents.js';
+import { IChatEditingSession } from './chatEditingService.js';
 import { ChatModel, IChatModel, IChatRequestModeInfo, IChatRequestModel, IChatRequestVariableData, IChatResponseModel, IExportableChatData, ISerializableChatData } from './chatModel.js';
 import { IParsedChatRequest } from './chatParserTypes.js';
 import { IChatParserContext } from './chatRequestParser.js';
@@ -49,6 +52,7 @@ export interface IChatResponseErrorDetails {
 	responseIsFiltered?: boolean;
 	responseIsRedacted?: boolean;
 	isQuotaExceeded?: boolean;
+	isRateLimited?: boolean;
 	level?: ChatErrorLevel;
 	confirmationButtons?: IChatResponseErrorDetailsConfirmationButton[];
 	code?: string;
@@ -157,6 +161,8 @@ export interface IChatMultiDiffData {
 			originalUri?: URI;
 			modifiedUri?: URI;
 			goToFileUri?: URI;
+			added?: number;
+			removed?: number;
 		}>;
 	};
 	kind: 'multiDiffData';
@@ -170,7 +176,7 @@ export interface IChatProgressMessage {
 export interface IChatTask extends IChatTaskDto {
 	deferred: DeferredPromise<string | void>;
 	progress: (IChatWarningMessage | IChatContentReference)[];
-	onDidAddProgress: Event<IChatWarningMessage | IChatContentReference>;
+	readonly onDidAddProgress: Event<IChatWarningMessage | IChatContentReference>;
 	add(progress: IChatWarningMessage | IChatContentReference): void;
 
 	complete: (result: string | void) => void;
@@ -255,6 +261,8 @@ export interface IChatConfirmation {
 	title: string;
 	message: string | IMarkdownString;
 	data: any;
+	/** Indicates whether this came from a current chat session (true/undefined) or a restored historic session (false) */
+	isLive?: boolean;
 	buttons?: string[];
 	isUsed?: boolean;
 	kind: 'confirmation';
@@ -265,21 +273,23 @@ export interface IChatElicitationRequest {
 	title: string | IMarkdownString;
 	message: string | IMarkdownString;
 	acceptButtonLabel: string;
-	rejectButtonLabel: string;
+	rejectButtonLabel: string | undefined;
 	subtitle?: string | IMarkdownString;
 	source?: ToolDataSource;
 	state: 'pending' | 'accepted' | 'rejected';
 	acceptedResult?: Record<string, unknown>;
-	accept(): Promise<void>;
-	reject(): Promise<void>;
-	onDidRequestHide?: Event<void>;
+	moreActions?: IAction[];
+	accept(value: IAction | true): Promise<void>;
+	reject?: () => Promise<void>;
+	isHidden?: IObservable<boolean>;
+	hide?(): void;
 }
 
 export interface IChatThinkingPart {
 	kind: 'thinking';
-	value?: string;
+	value?: string | string[];
 	id?: string;
-	metadata?: string;
+	metadata?: { readonly [key: string]: any };
 }
 
 export interface IChatTerminalToolInvocationData {
@@ -341,9 +351,10 @@ export interface IChatToolInvocation {
 	pastTenseMessage: string | IMarkdownString | undefined;
 	resultDetails: IToolResult['toolResultDetails'];
 	source: ToolDataSource;
-	progress: IObservable<{ message?: string | IMarkdownString; progress: number }>;
+	progress: IObservable<{ message?: string | IMarkdownString; progress: number | undefined }>;
 	readonly toolId: string;
 	readonly toolCallId: string;
+	readonly fromSubAgent?: boolean;
 
 	isCompletePromise: Promise<void>;
 	isComplete: boolean;
@@ -375,6 +386,7 @@ export interface IChatToolInvocationSerialized {
 	toolCallId: string;
 	toolId: string;
 	source: ToolDataSource;
+	readonly fromSubAgent?: boolean;
 	kind: 'toolInvocationSerialized';
 }
 
@@ -401,6 +413,41 @@ export interface IChatTodoListContent {
 		description: string;
 		status: 'not-started' | 'in-progress' | 'completed';
 	}>;
+}
+
+export interface IChatMcpServersStarting {
+	readonly kind: 'mcpServersStarting';
+	readonly state?: IObservable<IAutostartResult>; // not hydrated when serialized
+	didStartServerIds?: string[];
+}
+
+export class ChatMcpServersStarting implements IChatMcpServersStarting {
+	public readonly kind = 'mcpServersStarting';
+
+	public didStartServerIds?: string[] = [];
+
+	public get isEmpty() {
+		const s = this.state.get();
+		return !s.working && s.serversRequiringInteraction.length === 0;
+	}
+
+	constructor(public readonly state: IObservable<IAutostartResult>) { }
+
+	wait() {
+		return new Promise<IAutostartResult>(resolve => {
+			autorunSelfDisposable(reader => {
+				const s = this.state.read(reader);
+				if (!s.working) {
+					reader.dispose();
+					resolve(s);
+				}
+			});
+		});
+	}
+
+	toJSON(): IChatMcpServersStarting {
+		return { kind: 'mcpServersStarting', didStartServerIds: this.didStartServerIds };
+	}
 }
 
 export interface IChatPrepareToolInvocationPart {
@@ -436,7 +483,8 @@ export type IChatProgress =
 	| IChatPrepareToolInvocationPart
 	| IChatThinkingPart
 	| IChatTaskSerialized
-	| IChatElicitationRequest;
+	| IChatElicitationRequest
+	| IChatMcpServersStarting;
 
 export interface IChatFollowup {
 	kind: 'reply';
@@ -553,6 +601,9 @@ export interface IChatEditingHunkAction {
 	linesRemoved: number;
 	outcome: 'accepted' | 'rejected';
 	hasRemainingEdits: boolean;
+	modeId?: string;
+	modelId?: string;
+	languageId?: string;
 }
 
 export type ChatUserAction = IChatVoteAction | IChatCopyAction | IChatInsertAction | IChatApplyAction | IChatTerminalAction | IChatCommandAction | IChatFollowupAction | IChatBugReportAction | IChatInlineChatCodeAction | IChatEditingSessionAction | IChatEditingHunkAction;
@@ -564,6 +615,8 @@ export interface IChatUserActionEvent {
 	sessionId: string;
 	requestId: string;
 	result: IChatAgentResult | undefined;
+	modelId?: string | undefined;
+	modeId?: string | undefined;
 }
 
 export interface IChatDynamicRequest {
@@ -613,10 +666,12 @@ export interface IChatSendRequestData extends IChatSendRequestResponseState {
 }
 
 export interface IChatEditorLocationData {
-	type: ChatAgentLocation.Editor;
+	type: ChatAgentLocation.EditorInline;
 	document: URI;
 	selection: ISelection;
 	wholeRange: IRange;
+	close: () => void;
+	delegateSessionId: string | undefined;
 }
 
 export interface IChatNotebookLocationData {
@@ -646,12 +701,22 @@ export interface IChatSendRequestOptions {
 
 	/** The target agent ID can be specified with this property instead of using @ in 'message' */
 	agentId?: string;
+	/** agentId, but will not add a @ name to the request */
+	agentIdSilent?: string;
 	slashCommand?: string;
 
 	/**
 	 * The label of the confirmation action that was selected.
 	 */
 	confirmation?: string;
+
+	/**
+	 * Summary data for chat sessions context
+	 */
+	chatSummary?: {
+		prompt?: string;
+		history?: string;
+	};
 }
 
 export const IChatService = createDecorator<IChatService>('IChatService');
@@ -660,20 +725,22 @@ export interface IChatService {
 	_serviceBrand: undefined;
 	transferredSessionData: IChatTransferredSessionData | undefined;
 
-	onDidSubmitRequest: Event<{ chatSessionId: string }>;
+	readonly onDidSubmitRequest: Event<{ chatSessionId: string }>;
 
 	isEnabled(location: ChatAgentLocation): boolean;
 	hasSessions(): boolean;
-	startSession(location: ChatAgentLocation, token: CancellationToken, isGlobalEditingSession?: boolean): ChatModel;
+	startSession(location: ChatAgentLocation, token: CancellationToken, isGlobalEditingSession?: boolean, options?: { canUseTools?: boolean; inputType?: string }): ChatModel;
 	getSession(sessionId: string): IChatModel | undefined;
 	getOrRestoreSession(sessionId: string): Promise<IChatModel | undefined>;
 	getPersistedSessionTitle(sessionId: string): string | undefined;
 	isPersistedSessionEmpty(sessionId: string): boolean;
 	loadSessionFromContent(data: IExportableChatData | ISerializableChatData | URI): IChatModel | undefined;
 	loadSessionForResource(resource: URI, location: ChatAgentLocation, token: CancellationToken): Promise<IChatModel | undefined>;
+	readonly editingSessions: IChatEditingSession[];
+	getChatSessionFromInternalId(sessionId: string): { chatSessionType: string; chatSessionId: string; isUntitled: boolean } | undefined;
 
 	/**
-	 * Returns whether the request was accepted.
+	 * Returns whether the request was accepted.`
 	 */
 	sendRequest(sessionId: string, message: string, options?: IChatSendRequestOptions): Promise<IChatSendRequestData | undefined>;
 
@@ -690,9 +757,9 @@ export interface IChatService {
 	getChatStorageFolder(): URI;
 	logChatIndex(): void;
 
-	onDidPerformUserAction: Event<IChatUserActionEvent>;
+	readonly onDidPerformUserAction: Event<IChatUserActionEvent>;
 	notifyUserAction(event: IChatUserActionEvent): void;
-	onDidDisposeSession: Event<{ sessionId: string; reason: 'cleared' }>;
+	readonly onDidDisposeSession: Event<{ sessionId: string; reason: 'cleared' }>;
 
 	transferChatSession(transferredSessionData: IChatTransferredSessionData, toWorkspace: URI): void;
 

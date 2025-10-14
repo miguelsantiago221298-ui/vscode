@@ -19,6 +19,8 @@ import { ITerminalInstance } from '../../../terminal/browser/terminal.js';
 import { getOutput } from './outputHelpers.js';
 import { OutputMonitor } from './tools/monitoring/outputMonitor.js';
 import { IExecution, IPollingResult, OutputMonitorState } from './tools/monitoring/types.js';
+import { Event } from '../../../../../base/common/event.js';
+
 
 export function getTaskDefinition(id: string) {
 	const idx = id.indexOf(': ');
@@ -144,8 +146,29 @@ export async function resolveDependencyTasks(parentTask: Task, workspaceFolder: 
  * Collects output, polling duration, and idle status for all terminals.
  */
 export async function collectTerminalResults(
-	terminals: ITerminalInstance[], task: Task, instantiationService: IInstantiationService, invocationContext: IToolInvocationContext, progress: ToolProgress, token: CancellationToken, disposableStore: DisposableStore, isActive?: () => Promise<boolean>, dependencyTasks?: Task[]): Promise<Array<{ name: string; output: string; resources?: ILinkLocation[]; pollDurationMs: number; state: OutputMonitorState; inputToolManualAcceptCount: number; inputToolManualRejectCount: number; inputToolManualChars: number }>> {
-	const results: Array<{ state: OutputMonitorState; name: string; output: string; resources?: ILinkLocation[]; pollDurationMs: number; inputToolManualAcceptCount: number; inputToolManualRejectCount: number; inputToolManualChars: number }> = [];
+	terminals: ITerminalInstance[],
+	task: Task,
+	instantiationService: IInstantiationService,
+	invocationContext: IToolInvocationContext,
+	progress: ToolProgress,
+	token: CancellationToken,
+	disposableStore: DisposableStore,
+	isActive?: () => Promise<boolean>,
+	dependencyTasks?: Task[]
+): Promise<Array<{
+	name: string;
+	output: string;
+	resources?: ILinkLocation[];
+	pollDurationMs: number;
+	state: OutputMonitorState;
+	inputToolManualAcceptCount: number;
+	inputToolManualRejectCount: number;
+	inputToolManualChars: number;
+	inputToolManualShownCount: number;
+	inputToolFreeFormInputShownCount: number;
+	inputToolFreeFormInputCount: number;
+}>> {
+	const results: Array<{ state: OutputMonitorState; name: string; output: string; resources?: ILinkLocation[]; pollDurationMs: number; inputToolManualAcceptCount: number; inputToolManualRejectCount: number; inputToolManualChars: number; inputToolAutoAcceptCount: number; inputToolAutoChars: number; inputToolManualShownCount: number; inputToolFreeFormInputCount: number; inputToolFreeFormInputShownCount: number }> = [];
 	if (token.isCancellationRequested) {
 		return results;
 	}
@@ -159,21 +182,23 @@ export async function collectTerminalResults(
 			dependencyTasks,
 			sessionId: invocationContext.sessionId
 		};
-		const outputMonitor = disposableStore.add(instantiationService.createInstance(OutputMonitor, execution, taskProblemPollFn));
-		const outputAndIdle = await outputMonitor.startMonitoring(
-			task._label,
-			invocationContext,
-			token
-		);
+		const outputMonitor = disposableStore.add(instantiationService.createInstance(OutputMonitor, execution, taskProblemPollFn, invocationContext, token, task._label));
+		await Event.toPromise(outputMonitor.onDidFinishCommand);
+		const pollingResult = outputMonitor.pollingResult;
 		results.push({
 			name: instance.shellLaunchConfig.name ?? 'unknown',
-			output: outputAndIdle?.output ?? '',
-			pollDurationMs: outputAndIdle?.pollDurationMs ?? 0,
-			resources: outputAndIdle?.resources,
-			state: outputAndIdle?.state,
-			inputToolManualAcceptCount: outputAndIdle?.inputToolManualAcceptCount ?? 0,
-			inputToolManualRejectCount: outputAndIdle?.inputToolManualRejectCount ?? 0,
-			inputToolManualChars: outputAndIdle?.inputToolManualChars ?? 0,
+			output: pollingResult?.output ?? '',
+			pollDurationMs: pollingResult?.pollDurationMs ?? 0,
+			resources: pollingResult?.resources,
+			state: pollingResult?.state || OutputMonitorState.Idle,
+			inputToolManualAcceptCount: outputMonitor.outputMonitorTelemetryCounters.inputToolManualAcceptCount ?? 0,
+			inputToolManualRejectCount: outputMonitor.outputMonitorTelemetryCounters.inputToolManualRejectCount ?? 0,
+			inputToolManualChars: outputMonitor.outputMonitorTelemetryCounters.inputToolManualChars ?? 0,
+			inputToolAutoAcceptCount: outputMonitor.outputMonitorTelemetryCounters.inputToolAutoAcceptCount ?? 0,
+			inputToolAutoChars: outputMonitor.outputMonitorTelemetryCounters.inputToolAutoChars ?? 0,
+			inputToolManualShownCount: outputMonitor.outputMonitorTelemetryCounters.inputToolManualShownCount ?? 0,
+			inputToolFreeFormInputShownCount: outputMonitor.outputMonitorTelemetryCounters.inputToolFreeFormInputShownCount ?? 0,
+			inputToolFreeFormInputCount: outputMonitor.outputMonitorTelemetryCounters.inputToolFreeFormInputCount ?? 0,
 		});
 	}
 	return results;
@@ -199,27 +224,20 @@ export async function taskProblemPollFn(execution: IExecution, token: Cancellati
 							? new Range(marker.startLineNumber, marker.startColumn, marker.endLineNumber, marker.endColumn)
 							: undefined
 					});
-					const label: string = uri ? uri.path.split('/').pop() ?? uri.toString() : '';
 					const message = marker.message ?? '';
-					problemList.push(`Problem: ${message} in ${label} coming from ${owner}`);
+					problemList.push(`Problem: ${message} in ${uri.fsPath} coming from ${owner} starting on line ${marker.startLineNumber}${marker.startColumn ? `, column ${marker.startColumn} and ending on line ${marker.endLineNumber}${marker.endColumn ? `, column ${marker.endColumn}` : ''}` : ''}`);
 				}
 			}
 			if (problemList.length === 0) {
 				return {
 					state: OutputMonitorState.Idle,
 					output: 'The task succeeded with no problems.',
-					inputToolManualAcceptCount: 0,
-					inputToolManualRejectCount: 0,
-					inputToolManualChars: 0,
 				};
 			}
 			return {
 				state: OutputMonitorState.Idle,
 				output: problemList.join('\n'),
 				resources: resultResources,
-				inputToolManualAcceptCount: 0,
-				inputToolManualRejectCount: 0,
-				inputToolManualChars: 0,
 			};
 		}
 	}

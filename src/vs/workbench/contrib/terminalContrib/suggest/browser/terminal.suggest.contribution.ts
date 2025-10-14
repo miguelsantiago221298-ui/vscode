@@ -21,8 +21,9 @@ import { registerActiveInstanceAction, registerTerminalAction } from '../../../t
 import { registerTerminalContribution, type ITerminalContributionContext } from '../../../terminal/browser/terminalExtensions.js';
 import { TerminalContextKeys } from '../../../terminal/common/terminalContextKey.js';
 import { TerminalSuggestCommandId } from '../common/terminal.suggest.js';
-import { terminalSuggestConfigSection, TerminalSuggestSettingId, type ITerminalSuggestConfiguration, registerTerminalSuggestProvidersConfiguration } from '../common/terminalSuggestConfiguration.js';
+import { terminalSuggestConfigSection, TerminalSuggestSettingId, type ITerminalSuggestConfiguration, registerTerminalSuggestProvidersConfiguration, type ITerminalSuggestProviderInfo } from '../common/terminalSuggestConfiguration.js';
 import { ITerminalCompletionService, TerminalCompletionService } from './terminalCompletionService.js';
+import { ITerminalContributionService } from '../../../terminal/common/terminalExtensionPoints.js';
 import { InstantiationType, registerSingleton } from '../../../../../platform/instantiation/common/extensions.js';
 import { SuggestAddon } from './terminalSuggestAddon.js';
 import { TerminalClipboardContribution } from '../../clipboard/browser/terminal.clipboard.contribution.js';
@@ -90,6 +91,11 @@ class TerminalSuggestContribution extends DisposableStore implements ITerminalCo
 
 		// Initialize the dynamic providers configuration manager
 		TerminalSuggestProvidersConfigurationManager.initialize(this._instantiationService);
+
+		// Listen for terminal location changes to update the suggest widget container
+		this.add(this._ctx.instance.onDidChangeTarget((target) => {
+			this._updateContainerForTarget(target);
+		}));
 	}
 
 	xtermOpen(xterm: IXtermTerminal & { raw: RawXtermTerminal }): void {
@@ -148,11 +154,17 @@ class TerminalSuggestContribution extends DisposableStore implements ITerminalCo
 		xterm.loadAddon(addon);
 		this._loadLspCompletionAddon(xterm);
 
+		let container: HTMLElement | null = null;
 		if (this._ctx.instance.target === TerminalLocation.Editor) {
-			addon.setContainerWithOverflow(xterm.element!);
+			container = xterm.element!;
 		} else {
-			addon.setContainerWithOverflow(dom.findParentWithClass(xterm.element!, 'panel')!);
+			container = dom.findParentWithClass(xterm.element!, 'panel');
+			if (!container) {
+				// Fallback for sidebar or unknown location
+				container = xterm.element!;
+			}
 		}
+		addon.setContainerWithOverflow(container);
 		addon.setScreen(xterm.element!.querySelector('.xterm-screen')!);
 
 		this.add(dom.addDisposableListener(this._ctx.instance.domElement, dom.EventType.FOCUS_OUT, (e) => {
@@ -194,6 +206,28 @@ class TerminalSuggestContribution extends DisposableStore implements ITerminalCo
 		}
 		// Relies on shell type being set
 		this._loadLspCompletionAddon(this._ctx.instance.xterm.raw);
+	}
+
+	private _updateContainerForTarget(target: TerminalLocation | undefined): void {
+		const addon = this._addon.value;
+		if (!addon || !this._ctx.instance.xterm?.raw) {
+			return;
+		}
+
+		const xtermElement = this._ctx.instance.xterm.raw.element;
+		if (!xtermElement) {
+			return;
+		}
+
+		// Update the container based on the new target location
+		if (target === TerminalLocation.Editor) {
+			addon.setContainerWithOverflow(xtermElement);
+		} else {
+			const panelContainer = dom.findParentWithClass(xtermElement, 'panel');
+			if (panelContainer) {
+				addon.setContainerWithOverflow(panelContainer);
+			}
+		}
 	}
 }
 
@@ -435,10 +469,14 @@ class TerminalSuggestProvidersConfigurationManager extends Disposable {
 	}
 
 	constructor(
-		@ITerminalCompletionService private readonly _terminalCompletionService: ITerminalCompletionService
+		@ITerminalCompletionService private readonly _terminalCompletionService: ITerminalCompletionService,
+		@ITerminalContributionService private readonly _terminalContributionService: ITerminalContributionService
 	) {
 		super();
 		this._register(this._terminalCompletionService.onDidChangeProviders(() => {
+			this._updateConfiguration();
+		}));
+		this._register(this._terminalContributionService.onDidChangeTerminalCompletionProviders(() => {
 			this._updateConfiguration();
 		}));
 		// Initial configuration
@@ -446,9 +484,29 @@ class TerminalSuggestProvidersConfigurationManager extends Disposable {
 	}
 
 	private _updateConfiguration(): void {
-		const providers = Array.from(this._terminalCompletionService.providers);
-		const providerIds = providers.map(p => p.id).filter((id): id is string => typeof id === 'string');
-		registerTerminalSuggestProvidersConfiguration(providerIds);
+		const providerInfos: ITerminalSuggestProviderInfo[] = [];
+
+		// Add statically declared providers from package.json contributions
+		for (const contributedProvider of this._terminalContributionService.terminalCompletionProviders) {
+			providerInfos.push({
+				id: contributedProvider.id,
+				description: contributedProvider.description
+			});
+		}
+
+		// Add dynamically registered providers (that aren't already declared statically)
+		const staticProviderIds = new Set(providerInfos.map(p => p.id));
+		const dynamicProviders = Array.from(this._terminalCompletionService.providers);
+		for (const provider of dynamicProviders) {
+			if (provider.id && !staticProviderIds.has(provider.id)) {
+				providerInfos.push({
+					id: provider.id,
+					description: undefined
+				});
+			}
+		}
+
+		registerTerminalSuggestProvidersConfiguration(providerInfos);
 	}
 }
 

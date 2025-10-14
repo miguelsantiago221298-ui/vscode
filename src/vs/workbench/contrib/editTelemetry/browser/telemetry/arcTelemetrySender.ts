@@ -3,27 +3,27 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { sumBy } from '../../../../../base/common/arrays.js';
 import { TimeoutTimer } from '../../../../../base/common/async.js';
 import { onUnexpectedError } from '../../../../../base/common/errors.js';
-import { Disposable, toDisposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
-import { runOnChange, IObservableWithChange } from '../../../../../base/common/observable.js';
-import { LineEdit } from '../../../../../editor/common/core/edits/lineEdit.js';
+import { Disposable, DisposableStore, toDisposable } from '../../../../../base/common/lifecycle.js';
+import { IObservable, IObservableWithChange, runOnChange } from '../../../../../base/common/observable.js';
+import { generateUuid } from '../../../../../base/common/uuid.js';
 import { AnnotatedStringEdit, BaseStringEdit } from '../../../../../editor/common/core/edits/stringEdit.js';
 import { StringText } from '../../../../../editor/common/core/text/abstractText.js';
+import { EditDeltaInfo, EditSuggestionId, ITextModelEditSourceMetadata } from '../../../../../editor/common/textModelEditSource.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
-import { ArcTracker } from './arcTracker.js';
-import { IDocumentWithAnnotatedEdits, EditSourceData, createDocWithJustReason } from '../helpers/documentWithAnnotatedEdits.js';
+import { EditSourceData, IDocumentWithAnnotatedEdits, createDocWithJustReason } from '../helpers/documentWithAnnotatedEdits.js';
+import { IAiEditTelemetryService } from './aiEditTelemetry/aiEditTelemetryService.js';
+import { ArcTracker } from '../../common/arcTracker.js';
 import type { ScmRepoBridge } from './editSourceTrackingImpl.js';
-import { ITextModelEditSourceMetadata } from '../../../../../editor/common/textModelEditSource.js';
-import { generateUuid } from '../../../../../base/common/uuid.js';
-import { forwardToChannelIf, isCopilotLikeExtension } from './forwardingTelemetryService.js';
+import { forwardToChannelIf, isCopilotLikeExtension } from '../../../../../platform/dataChannel/browser/forwardingTelemetryService.js';
+import { ProviderId } from '../../../../../editor/common/languages.js';
 
 export class InlineEditArcTelemetrySender extends Disposable {
 	constructor(
 		docWithAnnotatedEdits: IDocumentWithAnnotatedEdits<EditSourceData>,
-		scmRepoBridge: ScmRepoBridge | undefined,
+		scmRepoBridge: IObservable<ScmRepoBridge | undefined>,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService
 	) {
 		super();
@@ -103,10 +103,59 @@ export class InlineEditArcTelemetrySender extends Disposable {
 	}
 }
 
+export class AiEditTelemetryAdapter extends Disposable {
+	constructor(
+		docWithAnnotatedEdits: IDocumentWithAnnotatedEdits<EditSourceData>,
+		@IAiEditTelemetryService private readonly _aiEditTelemetryService: IAiEditTelemetryService,
+	) {
+		super();
+
+		this._register(runOnChange(docWithAnnotatedEdits.value, (_val, _prev, changes) => {
+			const edit = AnnotatedStringEdit.compose(changes.map(c => c.edit));
+
+			const supportedSource = new Set(['Chat.applyEdits', 'inlineChat.applyEdits'] as ITextModelEditSourceMetadata['source'][]);
+
+			if (!edit.replacements.some(r => supportedSource.has(r.data.editSource.metadata.source))) {
+				return;
+			}
+			if (!edit.replacements.every(r => supportedSource.has(r.data.editSource.metadata.source))) {
+				onUnexpectedError(new Error(`ArcTelemetrySender: Not all edits are ${edit.replacements[0].data.editSource.metadata.source}!`));
+				return;
+			}
+			let applyCodeBlockSuggestionId: EditSuggestionId | undefined = undefined;
+			const data = edit.replacements[0].data.editSource;
+			let feature: 'inlineChat' | 'sideBarChat';
+			if (data.metadata.source === 'Chat.applyEdits') {
+				feature = 'sideBarChat';
+				if (data.metadata.$$mode === 'applyCodeBlock') {
+					applyCodeBlockSuggestionId = data.metadata.$$codeBlockSuggestionId;
+				}
+			} else {
+				feature = 'inlineChat';
+			}
+
+			const providerId = new ProviderId(data.props.$extensionId, data.props.$extensionVersion, data.props.$providerId);
+
+			// TODO@hediet tie this suggestion id to hunks, so acceptance can be correlated.
+			this._aiEditTelemetryService.createSuggestionId({
+				applyCodeBlockSuggestionId,
+				languageId: data.props.$$languageId,
+				presentation: 'highlightedEdit',
+				feature,
+				source: providerId,
+				modelId: data.props.$modelId,
+				// eslint-disable-next-line local/code-no-any-casts
+				modeId: data.props.$$mode as any,
+				editDeltaInfo: EditDeltaInfo.fromEdit(edit, _prev),
+			});
+		}));
+	}
+}
+
 export class ChatArcTelemetrySender extends Disposable {
 	constructor(
 		docWithAnnotatedEdits: IDocumentWithAnnotatedEdits<EditSourceData>,
-		scmRepoBridge: ScmRepoBridge | undefined,
+		scmRepoBridge: IObservable<ScmRepoBridge | undefined>,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService
 	) {
 		super();
@@ -241,7 +290,7 @@ export class ArcTelemetryReporter {
 		private readonly _documentValueBeforeTrackedEdit: StringText,
 		private readonly _document: { value: IObservableWithChange<StringText, { edit: BaseStringEdit }> },
 		// _markedEdits -> document.value
-		private readonly _gitRepo: ScmRepoBridge | undefined,
+		private readonly _gitRepo: IObservable<ScmRepoBridge | undefined>,
 		private readonly _trackedEdit: BaseStringEdit,
 		private readonly _sendTelemetryEvent: (res: EditTelemetryData) => void,
 
@@ -256,9 +305,9 @@ export class ArcTelemetryReporter {
 			}
 		}));
 
-		this._initialLineCounts = this._getLineCountInfo();
+		this._initialLineCounts = this._arcTracker.getLineCountInfo();
 
-		this._initialBranchName = this._gitRepo?.headBranchNameObs.get();
+		this._initialBranchName = this._gitRepo.get()?.headBranchNameObs.get();
 
 		for (let i = 0; i < this._timesMs.length; i++) {
 			const timeMs = this._timesMs[i];
@@ -273,17 +322,6 @@ export class ArcTelemetryReporter {
 		}
 	}
 
-	private _getLineCountInfo(): { deletedLineCounts: number; insertedLineCounts: number } {
-		const e = this._arcTracker.getTrackedEdit();
-		const le = LineEdit.fromEdit(e, this._documentValueBeforeTrackedEdit);
-		const deletedLineCount = sumBy(le.replacements, r => r.lineRange.length);
-		const insertedLineCount = sumBy(le.getNewLineRanges(), r => r.length);
-		return {
-			deletedLineCounts: deletedLineCount,
-			insertedLineCounts: insertedLineCount,
-		};
-	}
-
 	private _reportAfter(timeoutMs: number, cb?: () => void) {
 		const timer = new TimeoutTimer(() => {
 			this._report(timeoutMs);
@@ -296,9 +334,9 @@ export class ArcTelemetryReporter {
 	}
 
 	private _report(timeMs: number): void {
-		const currentBranch = this._gitRepo?.headBranchNameObs.get();
+		const currentBranch = this._gitRepo.get()?.headBranchNameObs.get();
 		const didBranchChange = currentBranch !== this._initialBranchName;
-		const currentLineCounts = this._getLineCountInfo();
+		const currentLineCounts = this._arcTracker.getLineCountInfo();
 
 		this._sendTelemetryEvent({
 			telemetryService: this._telemetryService,
